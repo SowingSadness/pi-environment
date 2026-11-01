@@ -541,6 +541,24 @@ export default function agentsExtension(pi: ExtensionAPI) {
 		if (!result.success) ctx.ui.notify(`agents: cannot apply theme: ${result.error ?? "unknown error"}`, "warning");
 	}
 
+	/** Applies the agent's configured tool set (unknown names dropped, planDir write tools added). */
+	function applyAgentTools(agent: AgentConfig, guard: Guard | undefined, ctx: ExtensionContext): string[] {
+		if (!agent.tools || agent.tools.length === 0) return pi.getActiveTools();
+		const known = new Set(pi.getAllTools().map((tool) => tool.name));
+		let valid = agent.tools.filter((tool) => known.has(tool));
+		if (DEPTH > 0) valid = valid.filter((tool) => tool !== "orchestrator_execution");
+		const unknown = agent.tools.filter((tool) => !known.has(tool));
+		if (unknown.length > 0) ctx.ui.notify(`agents: unknown tools: ${unknown.join(", ")}`, "warning");
+
+		// A plan dir is useless without the write tools, so add them when available.
+		if (guard?.planDir) {
+			for (const tool of ["write", "edit"]) if (known.has(tool) && !valid.includes(tool)) valid.push(tool);
+		}
+
+		if (valid.length > 0) pi.setActiveTools(valid);
+		return valid;
+	}
+
 	async function activate(name: string, ctx: ExtensionContext): Promise<boolean> {
 		const agent = agents[name];
 		if (!agent) {
@@ -578,23 +596,7 @@ export default function agentsExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		if (agent.tools && agent.tools.length > 0) {
-			const knownTools = pi.getAllTools().map((tool) => tool.name);
-			const known = new Set(knownTools);
-			let valid = agent.tools.filter((tool) => known.has(tool));
-			if (DEPTH > 0) valid = valid.filter((tool) => tool !== "orchestrator_execution");
-			const unknown = agent.tools.filter((tool) => !known.has(tool));
-			if (unknown.length > 0) ctx.ui.notify(`agents: unknown tools: ${unknown.join(", ")}`, "warning");
-
-			// A plan dir is useless without the write tools, so add them when available.
-			if (guard?.planDir) {
-				for (const tool of ["write", "edit"]) {
-					if (known.has(tool) && !valid.includes(tool)) valid.push(tool);
-				}
-			}
-
-			if (valid.length > 0) pi.setActiveTools(valid);
-		}
+		applyAgentTools(agent, guard, ctx);
 
 		inputColorToken = agent.inputColor
 			? resolveColorToken(ctx, agent.inputColor, "borderMuted", "inputColor")
@@ -799,7 +801,9 @@ export default function agentsExtension(pi: ExtensionAPI) {
 			return;
 		}
 		pi.sendUserMessage(
-			`Execute the plan at ${pending.plan} (route: ${pending.route}). Read it first and do not re-plan unless it is incomplete.${pending.notes ? `\n\nNotes: ${pending.notes}` : ""}`,
+			`Execute the plan at ${pending.plan} (route: ${pending.route}). ` +
+				`Start by calling start_run({ route: "${pending.route}", plan: "${pending.plan}" }); do not probe for tools from a previous mode. ` +
+				`Read the plan first and do not re-plan unless it is incomplete.${pending.notes ? `\n\nNotes: ${pending.notes}` : ""}`,
 		);
 	});
 
@@ -866,6 +870,7 @@ export default function agentsExtension(pi: ExtensionAPI) {
 		sections.agent = buildAgentSection({
 			name: activeName,
 			readOnly: Boolean(activeGuard),
+			tools: pi.getActiveTools(),
 			planDirAbs: activeGuard?.planDir ? resolveUserPath(activeGuard.planDir, ctx.cwd) : undefined,
 			runDirAbs: process.env.PI_RUN_DIR ? resolveUserPath(process.env.PI_RUN_DIR, ctx.cwd) : undefined,
 			allowCommands: activeGuard?.allowCommands,
@@ -901,10 +906,12 @@ export default function agentsExtension(pi: ExtensionAPI) {
 			.pop()?.data?.name;
 
 		if (saved && agents[saved]) {
-			// Do not re-apply model/tools on restore: the session already carries them.
+			// Do not re-apply model/thinking on restore: the session already carries them. Tools are
+			// re-applied because the transcript may carry leftovers from the previous mode.
 			activeName = saved;
 			activeAgent = agents[saved];
 			activeGuard = buildGuard(agents[saved]);
+			applyAgentTools(agents[saved], activeGuard, ctx);
 			inputColorToken = agents[saved].inputColor
 				? resolveColorToken(ctx, agents[saved].inputColor, "borderMuted", "inputColor")
 				: undefined;
