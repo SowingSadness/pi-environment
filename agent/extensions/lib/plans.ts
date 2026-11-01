@@ -1,0 +1,143 @@
+/**
+ * Plan file parsing.
+ *
+ * A plan written by the architect is the contract the orchestrator executes, so the format is
+ * deliberately simple and forgiving:
+ *
+ *   # Plan: <title>
+ *   ## Route
+ *   fast
+ *   ## Goal
+ *   one paragraph
+ *   ## Steps
+ *   ### 1. <step title>
+ *   - agent: coder
+ *   - files: [src/a.ts, src/b.ts]
+ *   - depends: —
+ *   - acceptance: tests pass
+ */
+
+export type PlanRoute = "full" | "fast" | "express";
+
+export interface PlanStep {
+	title: string;
+	agent?: string;
+	files: string[];
+	acceptance?: string;
+	depends?: string;
+}
+
+export interface ParsedPlan {
+	title?: string;
+	route?: PlanRoute;
+	goal?: string;
+	steps: PlanStep[];
+}
+
+const ROUTES = new Set<string>(["full", "fast", "express"]);
+
+function parseFiles(value: string): string[] {
+	return value
+		.replace(/^\[|\]$/g, "")
+		.split(",")
+		.map((item) => item.trim().replace(/^["'`]|["'`]$/g, ""))
+		.filter(Boolean);
+}
+
+function toRoute(value: string | undefined): PlanRoute | undefined {
+	const candidate = value?.trim().toLowerCase().replace(/[:.]$/, "");
+	return candidate && ROUTES.has(candidate) ? (candidate as PlanRoute) : undefined;
+}
+
+export function parsePlan(text: string): ParsedPlan {
+	const result: ParsedPlan = { steps: [] };
+	const goalLines: string[] = [];
+	let section: string | undefined;
+	let step: PlanStep | undefined;
+
+	const flushStep = () => {
+		if (step) {
+			result.steps.push(step);
+			step = undefined;
+		}
+	};
+
+	for (const rawLine of text.split(/\r?\n/)) {
+		const line = rawLine.trim();
+
+		const h1 = /^#\s+(.+)$/.exec(line);
+		if (h1) {
+			result.title ??= h1[1].trim();
+			section = undefined;
+			flushStep();
+			continue;
+		}
+
+		const h3 = /^###\s+(.+)$/.exec(line);
+		if (h3) {
+			flushStep();
+			step = { title: h3[1].replace(/^\d+[.)]\s*/, "").trim(), files: [] };
+			section = "steps";
+			continue;
+		}
+
+		const h2 = /^##\s+(.+)$/.exec(line);
+		if (h2) {
+			flushStep();
+			section = h2[1].trim().toLowerCase();
+			continue;
+		}
+
+		if (!line) continue;
+
+		if (section === "goal" && !step) {
+			goalLines.push(line);
+			continue;
+		}
+
+		if (section === "route" && !result.route) {
+			result.route = toRoute(line);
+			continue;
+		}
+
+		const field = /^[-*]?\s*(agent|files|depends|acceptance)\s*:\s*(.+)$/i.exec(line);
+		if (field && step) {
+			const key = field[1].toLowerCase();
+			const value = field[2].trim();
+			if (key === "agent") step.agent = value.replace(/["'`]/g, "").split(/\s+/)[0];
+			else if (key === "files") step.files = parseFiles(value);
+			else if (key === "acceptance") step.acceptance = value;
+			else if (key === "depends") step.depends = value;
+			continue;
+		}
+	}
+
+	flushStep();
+
+	// Fallback: numbered list under "## Steps" instead of "###" headings.
+	if (result.steps.length === 0) {
+		let inSteps = false;
+		for (const rawLine of text.split(/\r?\n/)) {
+			const line = rawLine.trim();
+			const h2 = /^##\s+(.+)$/.exec(line);
+			if (h2) {
+				inSteps = h2[1].trim().toLowerCase() === "steps";
+				continue;
+			}
+			if (!inSteps) continue;
+			const numbered = /^\d+[.)]\s+(.+)$/.exec(line);
+			if (numbered) result.steps.push({ title: numbered[1].trim(), files: [] });
+		}
+	}
+
+	// Route fallback: `route: fast` anywhere in the file.
+	if (!result.route) {
+		const match = /^\s*[-*]?\s*route\s*:\s*([A-Za-z]+)/im.exec(text);
+		result.route = toRoute(match?.[1]);
+	}
+
+	const goal = goalLines.join(" ").trim();
+	if (goal) result.goal = goal;
+
+	return result;
+}

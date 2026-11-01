@@ -1,0 +1,14 @@
+# Secrets / local state — never commit
+auth.json
+sessions/
+install/
+bin/
+npm/
+kendex/
+models-store.json
+trust.json
+settings.json
+*.bak.*
+
+# deps / build noise
+node_modules/

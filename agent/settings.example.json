@@ -1,0 +1,8 @@
+{
+  "theme": "system",
+  "defaultProvider": "deepseek",
+  "defaultModel": "deepseek-flash",
+  "terminal": {
+    "showTerminalProgress": true
+  }
+}
