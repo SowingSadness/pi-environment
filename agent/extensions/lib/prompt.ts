@@ -2,40 +2,41 @@
  * System-prompt section for the active agent.
  *
  * The runtime constraints are generated from the agent configuration so the model knows exactly
- * where it may write, instead of spending turns on refused `write`/`edit`/`bash` calls.
+ * what it may write and which shell commands are refused, instead of spending turns on blocked calls.
  */
 
 export interface AgentSectionParams {
 	name: string;
-	/** True when the agent runs with a read-only guard. */
 	readOnly: boolean;
-	/** Absolute directory where plan files may be written (only for read-only agents with planDir). */
 	planDirAbs?: string;
-	/** Absolute run directory of the delegating orchestrator (only in a subagent process). */
 	runDirAbs?: string;
-	/** Extra literal command prefixes allowed by the guard (e.g. "npx tsc --noEmit"). */
 	allowCommands?: string[];
 	instructions?: string;
 }
 
 const READ_ONLY_SHELL =
-	"`ls`, `cat`, `rg`/`find` (without -delete/-exec), `sed -n`, `git status/log/diff/show`, `npm ls`";
+	"`ls`, `cat`, `rg`/`find` (without -delete/-exec), `sed -n`, `git status/log/diff/show/rev-parse`, `npm ls`, `<command> --version`";
 
 export function buildAgentSection(params: AgentSectionParams): string {
 	const parts: string[] = [`Active agent: ${params.name}`];
 
 	if (params.readOnly) {
-		const lines = ["## Runtime constraints (enforced before execution, not by these instructions)"];
-		lines.push("- You are READ-ONLY: `edit`, `write` and mutating shell commands are refused by the runtime.");
+		const lines = ["## Runtime constraints (enforced by the runtime, not by these instructions)"];
+		lines.push(
+			"- The repository is READ-ONLY for you: `edit` and `write` are refused outside the writable locations below.",
+		);
 		if (params.planDirAbs) lines.push(`- Writable plan files: ${params.planDirAbs}`);
 		else lines.push("- File writes (including plan files) are refused.");
 		if (params.runDirAbs) lines.push(`- Writable task artifacts: ${params.runDirAbs}`);
-		lines.push(`- Shell: read-only only — ${READ_ONLY_SHELL}.`);
-		if (params.allowCommands && params.allowCommands.length > 0) {
-			lines.push(`- Extra allowed commands: ${params.allowCommands.join("; ")}.`);
-		}
 		lines.push(
-			"- A blocked call fails immediately. Do not retry it and do not bypass it with redirects, `tee` or `-o`: adapt or ask the user to switch agents.",
+			"- Plan changes: use `edit` with exact oldText/newText for a small change, and `write` only for a new plan or a full rewrite that is actually needed. Never rewrite a whole file to change a few lines.",
+		);
+		lines.push(`- Shell allowlist: ${READ_ONLY_SHELL}.`);
+		lines.push(
+			"- Refused before execution: any other program (python, node, bash -c, sh, perl, ruby, powershell, ...), output redirection `>` `>>`/`tee`, command substitution `$(...)` or backticks, `sed -i`, git write commands, package installs. A script cannot be used to edit files - use `write` or `edit`.",
+		);
+		lines.push(
+			"- A refused call fails immediately. Do not retry it and do not try to bypass it: use the tools listed above or ask the user.",
 		);
 		parts.push(lines.join("\n"));
 	} else {

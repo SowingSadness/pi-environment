@@ -684,11 +684,13 @@ export default function agentsExtension(pi: ExtensionAPI) {
 		name: "orchestrator_execution",
 		label: "Hand off the plan",
 		description:
-			"Ask the user once, then hand the written plan file to the orchestrator agent, which executes it with subagents. Only for the primary planning session; a delegated subagent must return its result instead.",
-		promptSnippet: "Hand a finished plan to the orchestrator for execution",
+			"Start implementation of an agreed plan. Hands the plan file to the orchestrator agent, which opens a run, splits the plan into steps, delegates them to coder/reviewer/handyman subagents, tracks progress and reports back; it does not edit code itself. Use it when the plan is written and the user confirmed they want to implement it. Only for the primary planning session - a delegated subagent must return its result instead.",
+		promptSnippet: "Start implementation of an agreed plan via the orchestrator agent",
 		promptGuidelines: [
-			"Call it once, after the plan file is written and the user agreed to execute it",
+			"Call it once, after the plan file is written and the user explicitly agreed to start implementation",
+			"It covers implementation, review and test runs of the plan; it is not for further design discussion",
 			"The plan must live inside the plan directory and contain a route (## Route) or pass route explicitly",
+			"After the handoff you are inactive until the run ends: do not try to implement anything yourself",
 		],
 		parameters: Type.Object({
 			plan: Type.String({ description: "Path to the plan file inside the plan directory, e.g. .pi/plans/session-cache.md" }),
