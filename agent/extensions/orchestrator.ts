@@ -61,7 +61,7 @@ const WATCHDOG_IDLE_MS = HEARTBEAT_SEC * 2500;
 // Types
 // ---------------------------------------------------------------------------
 
-type TaskStatus = "pending" | "running" | "done" | "failed" | "timeout";
+type TaskStatus = "pending" | "running" | "done" | "failed" | "timeout" | "aborted";
 
 interface RunWorktree extends WorktreeInfo {
 	headCommit?: string;
@@ -703,6 +703,17 @@ const finishRunParams = Type.Object({
 	),
 });
 
+const closeRunParams = Type.Object({
+	runId: Type.Optional(Type.String({ description: "Run id; defaults to the open run" })),
+	reason: Type.Optional(Type.String({ description: "Why the run is closed, e.g. \"hung\" or \"killed\"" })),
+	killProcesses: Type.Optional(
+		Type.Boolean({ description: "Best effort: kill child PIDs recorded in each task's state.json" }),
+	),
+	cleanupWorktrees: Type.Optional(
+		Type.Boolean({ description: "Remove this run's worktrees and branches (unmerged work is lost)" }),
+	),
+});
+
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -1316,6 +1327,168 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				],
 				details: { runId: run.id, status: params.status, tasks: run.tasks, cleanupErrors },
 				usage,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "close_run",
+		label: "Close run",
+		description:
+			"Force-close an open run whose tasks are stuck or whose processes were killed: best-effort PID kill, unfinished tasks become aborted, close.md records what was left behind.",
+		promptSnippet: "Abort a hung or killed run without the finish_run unfinished-task guard",
+		promptGuidelines: [
+			"Use close_run when a run hangs or its processes were killed; finish_run still refuses runs with unfinished tasks",
+			"Process killing is best effort: a recorded PID may already be reused by another process",
+		],
+		parameters: closeRunParams,
+		executionMode: "sequential",
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const run = loadRun(ctx.cwd, params.runId);
+			if (!run) {
+				return {
+					content: [{ type: "text", text: `Unknown run "${params.runId ?? "open run"}": no run.json found.` }],
+					details: undefined,
+					isError: true,
+				};
+			}
+
+			if (run.status !== "open") {
+				return {
+					content: [{ type: "text", text: `Run ${run.id} is already ${run.status}; it was not modified.` }],
+					details: { runId: run.id, status: run.status },
+				};
+			}
+
+			const reason = params.reason?.trim() || "not given";
+			const killed: number[] = [];
+			const killErrors: string[] = [];
+			if (params.killProcesses) {
+				for (const task of run.tasks) {
+					const statePath = join(runDir(ctx.cwd, run.id), "tasks", task.id, "state.json");
+					if (!existsSync(statePath)) continue;
+					let pid: number | undefined;
+					let finishedAt: number | undefined;
+					try {
+						const state = JSON.parse(readFileSync(statePath, "utf-8")) as { pid?: number; finishedAt?: number };
+						pid = state.pid;
+						finishedAt = state.finishedAt;
+					} catch (err) {
+						killErrors.push(`${task.id}: cannot read state.json (${err instanceof Error ? err.message : String(err)})`);
+						continue;
+					}
+					if (finishedAt !== undefined && finishedAt !== null) continue;
+					if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) continue;
+					const targetPid: number = pid;
+					try {
+						process.kill(targetPid, 0);
+					} catch {
+						continue; // process is already gone
+					}
+					try {
+						process.kill(targetPid, "SIGTERM");
+						killed.push(targetPid);
+						const timer = setTimeout(() => {
+							try {
+								process.kill(targetPid, "SIGKILL");
+							} catch {
+								// exited between SIGTERM and SIGKILL: nothing to do
+							}
+						}, 3000);
+						timer.unref?.();
+					} catch (err) {
+						killErrors.push(`${task.id}: SIGTERM to ${targetPid} failed (${err instanceof Error ? err.message : String(err)})`);
+					}
+				}
+			}
+
+			const aborted: string[] = [];
+			const abortedAt = Date.now();
+			for (const task of run.tasks) {
+				if (task.status !== "running" && task.status !== "pending") continue;
+				task.status = "aborted";
+				task.endedAt = abortedAt;
+				aborted.push(task.id);
+			}
+
+			const runner: CommandRunner = (command, args, options) => pi.exec(command, args, options);
+			const cleanupErrors: string[] = [];
+			const removedWorktrees: string[] = [];
+			if (params.cleanupWorktrees) {
+				for (const task of run.tasks) {
+					if (!task.worktree) continue;
+					const errors = await removeWorktree(runner, ctx.cwd, task.worktree, signal);
+					if (errors.length > 0) cleanupErrors.push(...errors.map((error) => `${task.id}: ${error}`));
+					else removedWorktrees.push(task.worktree.branch);
+				}
+			}
+
+			run.status = "aborted";
+			run.endedAt = Date.now();
+			writeRun(ctx.cwd, run);
+			activeRuns.delete(run.id);
+
+			const worktrees = run.tasks
+				.filter((task) => task.worktree)
+				.map((task) => ({ taskId: task.id, agent: task.agent, branch: task.worktree!.branch, path: task.worktree!.path }));
+
+			const closePath = join(runDir(ctx.cwd, run.id), "close.md");
+			writeFileSync(
+				closePath,
+				[
+					`# Close run ${run.id}`,
+					"",
+					`Goal: ${run.goal}`,
+					`Route: ${run.route}`,
+					`Started: ${new Date(run.startedAt).toISOString()}`,
+					`Closed: ${new Date(run.endedAt).toISOString()}`,
+					`Reason: ${reason}`,
+					"",
+					"## Aborted tasks",
+					"",
+					...(aborted.length > 0 ? aborted.map((id) => `- ${id}`) : ["- none"]),
+					"",
+					"## Killed processes",
+					"",
+					...(killed.length > 0
+						? killed.map((pid) => `- pid ${pid} (SIGTERM, then SIGKILL after 3s; best effort, the PID may be reused)`)
+						: ["- none"]),
+					"",
+					"## Worktrees",
+					"",
+					...(worktrees.length > 0
+						? worktrees.map((tree) => `- ${tree.taskId} (${tree.agent}): \`${tree.branch}\` at \`${tree.path}\``)
+						: ["- none"]),
+					"",
+					...(removedWorktrees.length > 0 ? ["Removed branches: " + removedWorktrees.join(", "), ""] : []),
+					...(cleanupErrors.length > 0 || killErrors.length > 0
+						? [
+								"## Errors",
+								"",
+								...[...killErrors, ...cleanupErrors].map((error) => `- ${error}`),
+								"",
+							]
+						: []),
+					"Branches and worktrees are kept unless cleanupWorktrees was true.",
+					"",
+				].join("\n"),
+				"utf-8",
+			);
+
+			const lines = [
+				`Run ${run.id} closed as aborted (reason: ${reason}).`,
+				`Tasks marked aborted: ${aborted.length}${aborted.length > 0 ? ` (${aborted.join(", ")})` : ""}`,
+				`Processes killed: ${killed.length}${killed.length > 0 ? ` (${killed.join(", ")}; best effort, PIDs can be reused)` : ""}`,
+				`Worktrees removed: ${removedWorktrees.length}`,
+				`Worktrees kept: ${worktrees.length}${worktrees.length > 0 ? ` (${worktrees.map((tree) => tree.branch).join(", ")})` : ""}`,
+			];
+			if (killErrors.length > 0) lines.push(`Kill errors: ${killErrors.join("; ")}`);
+			if (cleanupErrors.length > 0) lines.push(`Cleanup errors: ${cleanupErrors.join("; ")}`);
+			lines.push(`Details: ${closePath}`);
+
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { runId: run.id, aborted, killed, killErrors, cleanupErrors, worktrees },
 			};
 		},
 	});
