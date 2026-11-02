@@ -133,6 +133,8 @@ interface TaskOutcome {
 	usage: Usage;
 	taskDir: string;
 	idleMs: number;
+	/** Live status of a running task: last log line, current tool or start marker. */
+	progress?: string;
 	worktree?: RunWorktree;
 	merge?: RunMerge;
 }
@@ -227,6 +229,22 @@ function heartbeatAge(taskDir: string): number | undefined {
 		if (!last) return undefined;
 		const parsed = JSON.parse(last) as { ts?: number };
 		return typeof parsed.ts === "number" ? Date.now() - parsed.ts : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Last meaningful line of the child's log.md, cleaned up and truncated. */
+function lastLogLine(taskDir: string, maxChars = 110): string | undefined {
+	const path = join(taskDir, "log.md");
+	if (!existsSync(path)) return undefined;
+	try {
+		const lines = readFileSync(path, "utf-8").split("\n");
+		for (let i = lines.length - 1; i >= 0; i--) {
+			const line = (lines[i] ?? "").replace(/^[-*#\s]+/, "").trim();
+			if (line) return line.slice(0, maxChars);
+		}
+		return undefined;
 	} catch {
 		return undefined;
 	}
@@ -420,6 +438,7 @@ function runChildAgent(params: {
 		usage,
 		taskDir,
 		idleMs: 0,
+		progress: "starting…",
 	};
 	outcomes.push(outcome);
 
@@ -456,10 +475,16 @@ function runChildAgent(params: {
 	writeState();
 
 	const emit = () => {
-		outcome.output = clip(lastText || (lastTool ? `…${lastTool}` : ""), MAX_OUTPUT_BYTES);
+		outcome.durationMs = Date.now() - startedAt;
 		outcome.idleMs = heartbeatAge(taskDir) ?? Date.now() - lastEventAt;
+		outcome.progress =
+			lastLogLine(taskDir) ??
+			(lastTool ? `…${lastTool}` : undefined) ??
+			(lastText.trim().split("\n").pop() || undefined)?.slice(0, 110) ??
+			"starting…";
 		onUpdate?.();
 	};
+	emit();
 
 	const invocation = getPiInvocation([
 		"--agent",
@@ -504,12 +529,12 @@ function runChildAgent(params: {
 		outcome.status = "timeout";
 		killChild();
 	}, (task.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000);
-	const watchdogHandle = setInterval(() => {
+	const progressHandle = setInterval(() => {
 		if (finished) return;
 		emit();
 		writeState();
-	}, 30_000);
-	watchdogHandle.unref?.();
+	}, 2_000);
+	progressHandle.unref?.();
 
 	const onAbort = () => {
 		if (finished) return;
@@ -571,7 +596,7 @@ function runChildAgent(params: {
 		if (finished) return;
 		finished = true;
 		clearTimeout(timeoutHandle);
-		clearInterval(watchdogHandle);
+		clearInterval(progressHandle);
 		signal?.removeEventListener("abort", onAbort);
 		if (buffer.trim()) processLine(buffer);
 
@@ -1195,12 +1220,19 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 			if (!details) return new Text("", 0, 0);
 			const lines = details.results.map((item) => {
 				const icon = item.status === "done" ? "✓" : item.status === "running" ? "…" : "✗";
-				const idle =
-					item.status === "running" && item.idleMs > WATCHDOG_IDLE_MS
-						? theme.fg("warning", ` idle ${Math.round(item.idleMs / 1000)}s`)
-						: "";
+				const seconds = theme.fg("muted", `${Math.round(item.durationMs / 1000)}s`);
+				if (item.status === "running") {
+					const idle =
+						item.idleMs > WATCHDOG_IDLE_MS
+							? theme.fg("warning", ` idle ${Math.round(item.idleMs / 1000)}s`)
+							: "";
+					const progress = item.progress?.trim() || "starting";
+					const row = `${icon} ${theme.fg("accent", item.agent)} ${seconds} · ${theme.fg("dim", progress.slice(0, 110))}${idle}`;
+					if (!expanded) return row;
+					return [row, theme.fg("dim", item.output)].join("\n");
+				}
 				const text = expanded ? item.output : (item.output.split("\n")[0] ?? "");
-				return `${icon} ${theme.fg("accent", item.agent)} ${theme.fg("muted", `${Math.round(item.durationMs / 1000)}s`)}${idle} ${theme.fg("dim", text.slice(0, 100))}`;
+				return `${icon} ${theme.fg("accent", item.agent)} ${seconds} · ${theme.fg("dim", text.slice(0, 100))}`;
 			});
 			return new Text(lines.join("\n"), 0, 0);
 		},
@@ -1524,6 +1556,9 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 
 function renderOutcomes(outcomes: TaskOutcome[]): string {
 	return outcomes
-		.map((outcome) => `## ${outcome.agent} — ${outcome.status} (${Math.round(outcome.durationMs / 1000)}s)\n\n${outcome.output}`)
+		.map((outcome) => {
+			const body = outcome.status === "running" ? (outcome.progress ?? "starting…") : outcome.output;
+			return `## ${outcome.agent} — ${outcome.status} (${Math.round(outcome.durationMs / 1000)}s)\n\n${body}`;
+		})
 		.join("\n\n---\n\n");
 }
