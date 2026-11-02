@@ -25,7 +25,7 @@ export interface RouteSpec {
 export const ROUTES: Record<RouteName, RouteSpec> = {
 	full: {
 		description: "Полный цикл: разведка → план → реализация → ревью",
-		maxDelegations: 12,
+		maxDelegations: 14,
 		agents: "any",
 		worktree: true,
 		steps: [
