@@ -24,7 +24,7 @@ import { basename, join, resolve } from "node:path";
 import { StringEnum, Type, type Usage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { type AgentConfig, type ThinkingLevel, loadAgents, resolveThinking } from "./lib/agents-config.ts";
+import { type AgentConfig, type ThinkingLevel, isWriter, loadAgents, resolveThinking } from "./lib/agents-config.ts";
 import { type ParsedPlan, parseDepends, parsePlan } from "./lib/plans.ts";
 import { type BriefStep, buildTaskBrief } from "./lib/brief.ts";
 import {
@@ -113,6 +113,8 @@ interface RunLedger {
 	/** Absolute path of the plan this run executes, when handed off by the architect. */
 	planPath?: string;
 	planTitle?: string;
+	/** True when the plan has no `## Context` section: a read-only task must map the product first. */
+	needsContext?: boolean;
 	root: string;
 	startedAt: number;
 	endedAt?: number;
@@ -274,9 +276,12 @@ function buildBrief(params: {
 	index: number;
 	total: number;
 	step?: number;
+	contextDuty?: boolean;
 }): string {
 	const { agent, task, run, taskId, index, total } = params;
 	const runPath = runDir(run.root, run.id);
+	const planCopy = join(runPath, "plan.md");
+	const planCopyPath = existsSync(planCopy) ? planCopy : undefined;
 	const priorResults = run.tasks
 		.filter((record) => record.status === "done" && record.id !== taskId)
 		.map((record) => join(runPath, "tasks", record.id, "result.md"))
@@ -303,12 +308,13 @@ function buildBrief(params: {
 		context: task.context,
 		scope: task.scope,
 		files: task.files,
-		planPath: run.planPath,
+		planPath: planCopyPath ?? run.planPath,
 		contextPath: run.planPath ? join(runPath, "context.md") : undefined,
 		priorResults,
 		steps,
 		step: params.step,
 		verify: task.verify,
+		contextDuty: params.contextDuty,
 		depth: DEPTH + 1,
 	});
 }
@@ -383,6 +389,8 @@ function runChildAgent(params: {
 	briefOverride?: string;
 	/** 1-based plan step this task implements. */
 	step?: number;
+	/** This read-only task must produce the shared product context. */
+	contextDuty?: boolean;
 }): Promise<TaskOutcome> {
 	const { root, run, agentName, agent, level, task, taskId, signal, outcomes, onUpdate, ledgerTask } = params;
 	const { runner, cwd, worktree, merge } = params;
@@ -417,7 +425,16 @@ function runChildAgent(params: {
 
 	const brief =
 		params.briefOverride ??
-		buildBrief({ agent: agentName, task, run, taskId, index: params.index, total: params.total, step: params.step });
+		buildBrief({
+			agent: agentName,
+			task,
+			run,
+			taskId,
+			index: params.index,
+			total: params.total,
+			step: params.step,
+			contextDuty: params.contextDuty,
+		});
 	writeFileSync(join(taskDir, "brief.md"), `${brief}\n`, "utf-8");
 
 	const statePath = join(taskDir, "state.json");
@@ -813,6 +830,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 					: undefined,
 				planPath,
 				planTitle: parsed?.title,
+				needsContext: Boolean(parsed && !parsed.context?.trim()),
 				root: ctx.cwd,
 				startedAt: Date.now(),
 				status: "open",
@@ -825,7 +843,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 			if (planPath) {
 				const contextText =
 					parsed?.context?.trim() ||
-					"(no `## Context` section in the plan; rely on plan.md and the project rules)";
+					"(no `## Context` section in the plan yet: a read-only scout task must produce the product map; its result.md is the shared context until then)";
 				writeFileSync(join(runPath, "context.md"), `${contextText}\n`, "utf-8");
 			}
 			writeFileSync(join(runPath, "results.md"), "# Results\n\n", "utf-8");
@@ -873,6 +891,12 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 							"",
 							"Route checklist:",
 							checklist,
+							...(run.needsContext
+								? [
+										"",
+										"No `## Context` section in the plan: delegate a read-only scout task first (agent scout, scope \"product map\", no step). Writer tasks are rejected until it finishes.",
+									]
+								: []),
 							"",
 							`Next: delegate({ runId: "${runId}", tasks: [...] }). Close with finish_run.`,
 						].join("\n"),
@@ -989,6 +1013,17 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				}
 			}
 			if (stepIssues.length > 0) return reject(stepIssues.join("; "));
+
+			if (run.needsContext && tasks.some((task) => isWriter(agents[task.agent]))) {
+				const contextReady = run.tasks.some(
+					(record) => record.status === "done" && !isWriter(agents[record.agent]),
+				);
+				if (!contextReady) {
+					return reject(
+						"no product context in this run: delegate a read-only scout task first (agent scout or architect, scope \"product map\", no step) so its result.md becomes the shared context; writer tasks are rejected until then",
+					);
+				}
+			}
 
 			// Worktrees created before a failure must stay visible so they can be cleaned up later.
 			const rejectAfterCreate = (message: string) => {
@@ -1108,7 +1143,11 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 						cwd: job.worktree?.path ?? ctx.cwd,
 						worktree: job.worktree,
 						step: job.task.step,
+						contextDuty: run.needsContext && !isWriter(agents[job.task.agent]),
 					});
+					if (run.needsContext && job.ledgerTask.status === "done" && !isWriter(agents[job.task.agent])) {
+						run.needsContext = false;
+					}
 					if (job.task.step && job.ledgerTask.status === "done") {
 						const record = run.planSteps?.find((item) => item.index === job.task.step);
 						if (record) record.status = "done";

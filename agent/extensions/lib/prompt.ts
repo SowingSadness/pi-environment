@@ -29,7 +29,8 @@ export function buildAgentSection(params: AgentSectionParams): string {
 		if (params.tools && params.tools.length > 0)
 			lines.push(`- Active tools for this mode: ${params.tools.join(", ")}. Tools from a previous mode are not available; do not try them.`);
 		if (params.planDirAbs) lines.push(`- Writable plan files: ${params.planDirAbs}`);
-		else lines.push("- File writes (including plan files) are refused.");
+		else if (!params.runDirAbs) lines.push("- File writes (including plan files) are refused.");
+		else lines.push("- File writes are refused except for the task artifacts below.");
 		if (params.runDirAbs) lines.push(`- Writable task artifacts: ${params.runDirAbs}`);
 		lines.push(
 			"- Plan changes: use `edit` with exact oldText/newText for a small change, and `write` only for a new plan or a full rewrite that is actually needed. Never rewrite a whole file to change a few lines.",

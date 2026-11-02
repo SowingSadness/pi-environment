@@ -36,6 +36,8 @@ export interface TaskBriefParams {
 	step?: number;
 	/** Reviewer/verification duty: check completed steps against the plan. */
 	verify?: boolean;
+	/** This read-only task must produce the shared product context (no `## Context` in the plan). */
+	contextDuty?: boolean;
 	depth: number;
 }
 
@@ -59,6 +61,7 @@ export function buildTaskBrief(params: TaskBriefParams): string {
 		steps,
 		step,
 		verify,
+		contextDuty,
 		depth,
 	} = params;
 
@@ -88,6 +91,20 @@ export function buildTaskBrief(params: TaskBriefParams): string {
 	]
 		.filter(Boolean)
 		.join("\n");
+
+	const contextSection = contextDuty
+		? [
+				"",
+				"## Shared context duty (required)",
+				"The plan has no `## Context` section, so you produce the shared product context for all later tasks.",
+				"Put it in `result.md` under these headings and keep it under ~40 lines:",
+				"- Layers: the modules/layers that matter for this run and what each owns.",
+				"- Invariants / do-not-break: public APIs, state shape, conventions, tests that must stay green.",
+				"- Boundaries: which paths each layer owns, so parallel tasks do not collide.",
+				"- Risks: what is easy to break in this area.",
+			]
+			.join("\n")
+		: "";
 
 	const finished = (steps ?? []).filter((item) => item.status === "done");
 	const verification =
@@ -145,6 +162,7 @@ export function buildTaskBrief(params: TaskBriefParams): string {
 		"6. Do not touch files outside the list above. Do not commit unless this task explicitly asks for a commit.",
 		`7. You are a delegated subagent (depth ${depth}): do not call orchestrator_execution, start_run or delegate. Return your result to the caller that delegated this task.`,
 		"8. No user is present in this session: never ask questions, state your assumptions explicitly instead.",
+		contextSection,
 		verification,
 		"",
 		"## Return format",
