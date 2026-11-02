@@ -58,6 +58,12 @@ export interface DelegateTask {
 	context?: string;
 	files?: string[];
 	timeoutSec?: number;
+	/** 1-based plan step this task implements; the runtime enforces `depends` for it. */
+	step?: number;
+	/** Ownership scope in words, e.g. "surface weather only; do not touch materials or HUD". */
+	scope?: string;
+	/** Verification duty: check completed steps against the plan and acceptance criteria. */
+	verify?: boolean;
 	/** Run the task in an isolated git worktree (full route only). */
 	worktree?: boolean | { base?: string };
 	/** Merge worktree branches in the main workspace; runs alone, coder only. */

@@ -25,7 +25,8 @@ import { StringEnum, Type, type Usage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { type AgentConfig, type ThinkingLevel, loadAgents, resolveThinking } from "./lib/agents-config.ts";
-import { type ParsedPlan, parsePlan } from "./lib/plans.ts";
+import { type ParsedPlan, parseDepends, parsePlan } from "./lib/plans.ts";
+import { type BriefStep, buildTaskBrief } from "./lib/brief.ts";
 import {
 	type DelegateTask,
 	ROUTES,
@@ -86,8 +87,20 @@ interface RunTaskRecord {
 	exitCode?: number;
 	usage: Usage;
 	files?: string[];
+	/** 1-based plan step this task implements. */
+	step?: number;
 	worktree?: RunWorktree;
 	merge?: RunMerge;
+}
+
+interface RunStepRecord {
+	index: number;
+	title: string;
+	agent?: string;
+	files: string[];
+	depends: number[];
+	acceptance?: string;
+	status: "pending" | "done";
 }
 
 interface RunLedger {
@@ -95,6 +108,8 @@ interface RunLedger {
 	route: RouteName;
 	goal: string;
 	steps?: string;
+	/** Plan steps of this run, with dependency order and completion state. */
+	planSteps?: RunStepRecord[];
 	/** Absolute path of the plan this run executes, when handed off by the architect. */
 	planPath?: string;
 	planTitle?: string;
@@ -251,37 +266,51 @@ async function mapWithConcurrency<T>(items: T[], concurrency: number, fn: (item:
 	await Promise.all(workers);
 }
 
-function buildBrief(params: { agent: string; task: DelegateTask; run: RunLedger; taskId: string; index: number; total: number }): string {
+function buildBrief(params: {
+	agent: string;
+	task: DelegateTask;
+	run: RunLedger;
+	taskId: string;
+	index: number;
+	total: number;
+	step?: number;
+}): string {
 	const { agent, task, run, taskId, index, total } = params;
-	const taskDir = `.pi/runs/${run.id}/tasks/${taskId}`;
-	const files = task.files?.length ? task.files.map((file) => `- ${file}`).join("\n") : "- (not specified)";
-	return [
-		`# Task ${index + 1}/${total}: ${agent}`,
-		"",
-		`Run: ${run.id} (route: ${run.route})`,
-		`Working directory: ${run.root}`,
-		"",
-		"## Goal of the run",
-		run.goal,
-		"",
-		"## Your task",
-		task.task,
-		"",
-		"## Context from the orchestrator",
-		task.context?.trim() || "(none)",
-		"",
-		"## Files you may touch",
-		files,
-		"",
-		"## Work contract (required)",
-		`1. Before starting, write your work plan to \`${taskDir}/plan.md\`: numbered steps with checkboxes.`,
-		`2. Keep \`${taskDir}/log.md\` updated: one short line per meaningful step - what you did, which files, what is next.`,
-		"3. A 60-second heartbeat is written for you automatically; do not spend turns on it.",
-		`4. Finish by writing \`${taskDir}/result.md\` with: status (done | blocked | failed), summary (max 10 lines), files changed, tests run, open questions.`,
-		"5. Your final chat message must repeat that summary; the orchestrator only reads the summary.",
-		"6. Do not touch files outside the list above. Do not commit unless this task explicitly asks for a commit.",
-		`7. You are a delegated subagent (depth ${DEPTH + 1}): do not call orchestrator_execution, start_run or delegate. Return your result to the caller that delegated this task.`,
-	].join("\n");
+	const runPath = runDir(run.root, run.id);
+	const priorResults = run.tasks
+		.filter((record) => record.status === "done" && record.id !== taskId)
+		.map((record) => join(runPath, "tasks", record.id, "result.md"))
+		.filter((file) => existsSync(file));
+	const steps: BriefStep[] | undefined = run.planSteps?.map((item) => ({
+		index: item.index,
+		title: item.title,
+		status: item.status,
+		agent: item.agent,
+		depends: item.depends,
+		acceptance: item.acceptance,
+	}));
+
+	return buildTaskBrief({
+		runId: run.id,
+		route: run.route,
+		goal: run.goal,
+		root: run.root,
+		agent,
+		index,
+		total,
+		taskId,
+		task: task.task,
+		context: task.context,
+		scope: task.scope,
+		files: task.files,
+		planPath: run.planPath,
+		contextPath: run.planPath ? join(runPath, "context.md") : undefined,
+		priorResults,
+		steps,
+		step: params.step,
+		verify: task.verify,
+		depth: DEPTH + 1,
+	});
 }
 
 function buildMergeBrief(params: { run: RunLedger; task: DelegateTask; branches: string[]; target: string }): string {
@@ -352,6 +381,8 @@ function runChildAgent(params: {
 	merge?: { branches: string[]; target: string };
 	/** Replaces the default task brief (used for merge tasks). */
 	briefOverride?: string;
+	/** 1-based plan step this task implements. */
+	step?: number;
 }): Promise<TaskOutcome> {
 	const { root, run, agentName, agent, level, task, taskId, signal, outcomes, onUpdate, ledgerTask } = params;
 	const { runner, cwd, worktree, merge } = params;
@@ -384,7 +415,9 @@ function runChildAgent(params: {
 	};
 	outcomes.push(outcome);
 
-	const brief = params.briefOverride ?? buildBrief({ agent: agentName, task, run, taskId, index: params.index, total: params.total });
+	const brief =
+		params.briefOverride ??
+		buildBrief({ agent: agentName, task, run, taskId, index: params.index, total: params.total, step: params.step });
 	writeFileSync(join(taskDir, "brief.md"), `${brief}\n`, "utf-8");
 
 	const statePath = join(taskDir, "state.json");
@@ -613,6 +646,15 @@ const delegateParams = Type.Object({
 			context: Type.Optional(Type.String({ description: "Facts the subagent needs: plan excerpt, constraints, file list" })),
 			files: Type.Optional(Type.Array(Type.String(), { description: "Files this task will touch; required for parallel writers" })),
 			timeoutSec: Type.Optional(Type.Number({ description: "Per-task timeout in seconds, default 900" })),
+			step: Type.Optional(
+				Type.Number({ description: "1-based plan step this task implements; the plan's depends[] is enforced" }),
+			),
+			scope: Type.Optional(
+				Type.String({ description: "Ownership scope in words; anything outside it must not be touched" }),
+			),
+			verify: Type.Optional(
+				Type.Boolean({ description: "Verification duty: check completed steps against the plan and acceptance" }),
+			),
 			worktree: Type.Optional(
 				Type.Union([Type.Boolean(), Type.Object({ base: Type.Optional(Type.String({ description: "Commit or branch to create the worktree from, default HEAD" })) })], {
 					description: "Run this task in an isolated git worktree (full route, writer agents only)",
@@ -718,6 +760,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 
 			let parsed: ParsedPlan | undefined;
 			let planPath: string | undefined;
+			let planText: string | undefined;
 			const requestedPlan = params.plan?.trim();
 			if (requestedPlan) {
 				planPath = resolvePlanPath(ctx.cwd, requestedPlan);
@@ -729,7 +772,8 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 					};
 				}
 				try {
-					parsed = parsePlan(readFileSync(planPath, "utf-8"));
+					planText = readFileSync(planPath, "utf-8");
+					parsed = parsePlan(planText);
 				} catch (err) {
 					return {
 						content: [{ type: "text", text: `Cannot read plan ${requestedPlan}: ${err}` }],
@@ -756,6 +800,17 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				route,
 				goal,
 				steps: params.steps,
+				planSteps: parsed?.steps.length
+					? parsed.steps.map((item, index) => ({
+							index: index + 1,
+							title: item.title,
+							agent: item.agent,
+							files: item.files,
+							depends: parseDepends(item.depends),
+							acceptance: item.acceptance,
+							status: "pending" as const,
+						}))
+					: undefined,
 				planPath,
 				planTitle: parsed?.title,
 				root: ctx.cwd,
@@ -763,8 +818,17 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				status: "open",
 				tasks: [],
 			};
-			mkdirSync(join(runDir(ctx.cwd, runId), "tasks"), { recursive: true });
+			const runPath = runDir(ctx.cwd, runId);
+			mkdirSync(join(runPath, "tasks"), { recursive: true });
 			ensureGitignore(ctx.cwd);
+			if (planText) writeFileSync(join(runPath, "plan.md"), planText, "utf-8");
+			if (planPath) {
+				const contextText =
+					parsed?.context?.trim() ||
+					"(no `## Context` section in the plan; rely on plan.md and the project rules)";
+				writeFileSync(join(runPath, "context.md"), `${contextText}\n`, "utf-8");
+			}
+			writeFileSync(join(runPath, "results.md"), "# Results\n\n", "utf-8");
 			writeRun(ctx.cwd, run);
 			activeRuns.set(runId, run);
 
@@ -906,6 +970,26 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				isError: true,
 			});
 
+			const stepIssues: string[] = [];
+			for (const task of tasks) {
+				if (task.step === undefined) continue;
+				const record = run.planSteps?.find((item) => item.index === task.step);
+				if (!record) {
+					stepIssues.push(`agent "${task.agent}" references step ${task.step}, but the run has no such plan step`);
+					continue;
+				}
+				for (const dep of record.depends) {
+					const dependency = run.planSteps?.find((item) => item.index === dep);
+					if (dependency?.status === "done") continue;
+					const depTask = run.tasks.find((item) => item.step === dep);
+					const resultPath = depTask ? join(runDir(ctx.cwd, run.id), "tasks", depTask.id, "result.md") : undefined;
+					stepIssues.push(
+						`step ${task.step} depends on step ${dep}, which is not done${resultPath ? `; read ${resultPath} first` : ""}`,
+					);
+				}
+			}
+			if (stepIssues.length > 0) return reject(stepIssues.join("; "));
+
 			// Worktrees created before a failure must stay visible so they can be cleaned up later.
 			const rejectAfterCreate = (message: string) => {
 				const created = jobs.filter((job) => job.worktree);
@@ -1023,7 +1107,16 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 						runner,
 						cwd: job.worktree?.path ?? ctx.cwd,
 						worktree: job.worktree,
+						step: job.task.step,
 					});
+					if (job.task.step && job.ledgerTask.status === "done") {
+						const record = run.planSteps?.find((item) => item.index === job.task.step);
+						if (record) record.status = "done";
+						appendFileSync(
+							join(runDir(ctx.cwd, run.id), "results.md"),
+							`- step ${job.task.step} · ${job.task.agent} · done · tasks/${job.taskId}/result.md\n`,
+						);
+					}
 					writeRun(ctx.cwd, run);
 				});
 			}
@@ -1141,6 +1234,17 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 								...worktrees.map(
 									(task) =>
 										`- ${task.agent}: \`${task.worktree!.branch}\` at \`${task.worktree!.path}\`${task.worktree!.autoCommitted ? " (auto-committed)" : ""}`,
+								),
+								"",
+							]
+						: []),
+					...(run.planSteps?.length
+						? [
+								"## Plan steps",
+								"",
+								...run.planSteps.map(
+									(item) =>
+										`- ${item.index}. ${item.title} — ${item.status}${item.depends.length > 0 ? ` (after ${item.depends.join(",")})` : ""}`,
 								),
 								"",
 							]

@@ -31,6 +31,8 @@ export interface ParsedPlan {
 	title?: string;
 	route?: PlanRoute;
 	goal?: string;
+	/** Raw text of the `## Context` section: architecture, invariants, do-not-break list. */
+	context?: string;
 	steps: PlanStep[];
 }
 
@@ -52,6 +54,7 @@ function toRoute(value: string | undefined): PlanRoute | undefined {
 export function parsePlan(text: string): ParsedPlan {
 	const result: ParsedPlan = { steps: [] };
 	const goalLines: string[] = [];
+	const contextLines: string[] = [];
 	let section: string | undefined;
 	let step: PlanStep | undefined;
 
@@ -92,6 +95,11 @@ export function parsePlan(text: string): ParsedPlan {
 
 		if (section === "goal" && !step) {
 			goalLines.push(line);
+			continue;
+		}
+
+		if (section === "context" && !step) {
+			contextLines.push(line);
 			continue;
 		}
 
@@ -139,5 +147,16 @@ export function parsePlan(text: string): ParsedPlan {
 	const goal = goalLines.join(" ").trim();
 	if (goal) result.goal = goal;
 
+	const context = contextLines.join("\n").trim();
+	if (context) result.context = context;
+
 	return result;
+}
+
+/** Parse a step's `depends` field ("1, 2", "1 2", "—") into step numbers. */
+export function parseDepends(value: string | undefined): number[] {
+	if (!value) return [];
+	const matches = value.match(/\d+/g);
+	if (!matches) return [];
+	return [...new Set(matches.map((item) => Number.parseInt(item, 10)).filter((item) => Number.isFinite(item) && item > 0))];
 }
