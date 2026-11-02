@@ -18,6 +18,33 @@ export interface AgentSectionParams {
 const READ_ONLY_SHELL =
 	"`ls`, `cat`, `rg`/`find` (without -delete/-exec), `sed -n`, `git status/log/diff/show/rev-parse`, `npm ls`, `<command> --version`";
 
+/**
+ * One-line role reminder that is delivered as a message at the start of every run.
+ *
+ * The `<agent>` system section already describes the mode, but pi adds it as a separate delta for
+ * every switch, and the model can anchor on an older one. A short message placed after the history
+ * of the current run keeps the role in view without paying for the full section again.
+ *
+ * Must stay a single line of at most 200 characters (about 30 tokens).
+ */
+export function buildRoleReminder(name: string, readOnly: boolean, planDir?: string): string {
+	const reminders: Record<string, string> = {
+		architect:
+			"planning only: write plan files only, shell is read-only; when the plan is agreed and the user says yes, call orchestrator_execution; never edit code",
+		coder: "implementation: edit/write allowed; read before editing; run tests after changes; do not start orchestration",
+		orchestrator: "coordination only: start_run -> delegate -> finish_run; you are read-only; never probe write/edit",
+		scout: "reconnaissance only: read-only; return a compact product map, do not edit code",
+		reviewer: "review only: read-only; report file:line findings against the plan and acceptance criteria",
+		handyman: "small utility work only: do exactly what the brief says, commit only when asked",
+	};
+
+	const known = reminders[name.trim().toLowerCase()];
+	const body = known ?? [readOnly ? "read-only mode" : "write mode", planDir ? `plans in ${planDir}` : undefined]
+		.filter(Boolean)
+		.join(", ");
+	return `[agent mode] ${name}: ${body}`;
+}
+
 export function buildAgentSection(params: AgentSectionParams): string {
 	const parts: string[] = [`Active agent: ${params.name}`];
 

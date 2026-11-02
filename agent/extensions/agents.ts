@@ -59,7 +59,7 @@ import { Key, Text, colorToHex, type Color } from "@earendil-works/pi-tui";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import { findOpenRunId } from "./lib/runs.ts";
 import { parsePlan } from "./lib/plans.ts";
-import { buildAgentSection } from "./lib/prompt.ts";
+import { buildAgentSection, buildRoleReminder } from "./lib/prompt.ts";
 import { handoffRefusal } from "./lib/handoff.ts";
 import {
 	type AgentConfig,
@@ -488,6 +488,12 @@ export default function agentsExtension(pi: ExtensionAPI) {
 	let inputColorToken: string | undefined;
 	let statusColorToken = "accent";
 	let pendingHandoff: { plan: string; route: string; notes?: string } | undefined;
+	/** Agent that handed the plan to the orchestrator; control returns to it when the run ends. */
+	let handoffReturnTo: string | undefined;
+	/** Set when a run finished while the orchestrator was active; consumed on the next settle. */
+	let pendingReturn: string | undefined;
+	/** Agent that already received the role reminder, so it is sent once per switch. */
+	let lastReminderFor: string | undefined;
 
 	const agentNames = () => sortAgentNames(agents);
 
@@ -506,6 +512,7 @@ export default function agentsExtension(pi: ExtensionAPI) {
 		activeGuard = undefined;
 		inputColorToken = undefined;
 		statusColorToken = "accent";
+		lastReminderFor = undefined;
 	}
 
 	function resolveColorToken(ctx: ExtensionContext, value: unknown, fallback: string, field: string): string {
@@ -607,6 +614,8 @@ export default function agentsExtension(pi: ExtensionAPI) {
 		activeName = name;
 		activeAgent = agent;
 		activeGuard = guard;
+		// Every switch must produce a fresh reminder on the next run.
+		lastReminderFor = undefined;
 
 		ctx.ui.notify(`agent: ${name}${guard ? " (read-only)" : ""}`, "info");
 		updateStatus(ctx);
@@ -770,6 +779,8 @@ export default function agentsExtension(pi: ExtensionAPI) {
 			}
 
 			pendingHandoff = { plan: planAbs, route, notes: params.notes?.trim() || undefined };
+			// Remember who handed off: orchestrator.ts emits `orchestrator:run-finished` when the run ends.
+			handoffReturnTo = activeName;
 			return {
 				content: [
 					{
@@ -789,22 +800,37 @@ export default function agentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	// The orchestrator announces a closed run; the switch back happens once the turn settled.
+	pi.events.on("orchestrator:run-finished", () => {
+		if (handoffReturnTo) pendingReturn = handoffReturnTo;
+	});
+
 	// Switching agents mid-run breaks the queued message and the status line, so hand off once the turn settled.
 	pi.on("agent_settled", async (_event, ctx) => {
 		const pending = pendingHandoff;
-		if (!pending) return;
-		pendingHandoff = undefined;
+		if (pending) {
+			pendingHandoff = undefined;
 
-		const switched = await activate("orchestrator", ctx);
-		if (!switched) {
-			ctx.ui.notify("agents: cannot hand off, orchestrator is not configured", "error");
-			return;
+			const switched = await activate("orchestrator", ctx);
+			if (!switched) {
+				ctx.ui.notify("agents: cannot hand off, orchestrator is not configured", "error");
+				return;
+			}
+			pi.sendUserMessage(
+				`Execute the plan at ${pending.plan} (route: ${pending.route}). ` +
+					`Start by calling start_run({ route: "${pending.route}", plan: "${pending.plan}" }); do not probe for tools from a previous mode. ` +
+					`Read the plan first and do not re-plan unless it is incomplete.${pending.notes ? `\n\nNotes: ${pending.notes}` : ""}`,
+			);
 		}
-		pi.sendUserMessage(
-			`Execute the plan at ${pending.plan} (route: ${pending.route}). ` +
-				`Start by calling start_run({ route: "${pending.route}", plan: "${pending.plan}" }); do not probe for tools from a previous mode. ` +
-				`Read the plan first and do not re-plan unless it is incomplete.${pending.notes ? `\n\nNotes: ${pending.notes}` : ""}`,
-		);
+
+		const target = pendingReturn;
+		if (!target) return;
+		pendingReturn = undefined;
+		handoffReturnTo = undefined;
+		// If the user switched away in the meantime, their choice wins.
+		if (activeName !== "orchestrator") return;
+
+		if (await activate(target, ctx)) ctx.ui.notify(`agent: ${target} (returned after the run)`, "info");
 	});
 
 	pi.registerCommand("agent", {
@@ -876,6 +902,18 @@ export default function agentsExtension(pi: ExtensionAPI) {
 			allowCommands: activeGuard?.allowCommands,
 			instructions: activeAgent?.instructions,
 		});
+
+		// The system section is a delta per switch and easy to lose among older ones; repeat the role
+		// as a message at the start of every run, but only once per agent switch.
+		if (lastReminderFor === activeName) return;
+		lastReminderFor = activeName;
+		return {
+			message: {
+				customType: "agent-mode",
+				content: buildRoleReminder(activeName, Boolean(activeGuard), activeGuard?.planDir),
+				display: false,
+			},
+		};
 	});
 
 	// Track the agent in the branch so rewinds/resumes restore it.
@@ -888,6 +926,8 @@ export default function agentsExtension(pi: ExtensionAPI) {
 		clearActive();
 		originalState = undefined;
 		pendingHandoff = undefined;
+		handoffReturnTo = undefined;
+		pendingReturn = undefined;
 		restoreBaseTheme(ctx);
 
 		const flag = pi.getFlag("agent");

@@ -1311,6 +1311,8 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				"utf-8",
 			);
 			activeRuns.delete(run.id);
+			// Let the agents extension return control to whoever handed the plan off.
+			pi.events.emit("orchestrator:run-finished", { runId: run.id, status: run.status });
 
 			const perTask = run.tasks.map((task) => `${task.agent}: ${task.status} (${formatUsage(task.usage)})`).join("\n");
 			const cleanup = params.cleanupWorktrees
@@ -1427,6 +1429,8 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 			run.endedAt = Date.now();
 			writeRun(ctx.cwd, run);
 			activeRuns.delete(run.id);
+			// Let the agents extension return control to whoever handed the plan off.
+			pi.events.emit("orchestrator:run-finished", { runId: run.id, status: run.status });
 
 			const worktrees = run.tasks
 				.filter((task) => task.worktree)
