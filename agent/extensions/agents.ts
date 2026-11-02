@@ -772,13 +772,20 @@ export default function agentsExtension(pi: ExtensionAPI) {
 				);
 				if (!approved) {
 					return {
-						content: [{ type: "text" as const, text: "Execution declined. The plan file is kept; keep discussing or edit it." }],
+						content: [
+							{
+								type: "text" as const,
+								text: "Execution declined. Do not implement anything yourself, do not retry with another route or agent, and do not call start_run. Ask the user what to change in the plan.",
+							},
+						],
 						details: { declined: true },
 					};
 				}
 			}
 
 			pendingHandoff = { plan: planAbs, route, notes: params.notes?.trim() || undefined };
+			// The user just approved this plan+route: start_run must not ask a second time.
+			pi.events.emit("orchestrator:handoff-confirmed", { plan: planAbs, route });
 			// Remember who handed off: orchestrator.ts emits `orchestrator:run-finished` when the run ends.
 			handoffReturnTo = activeName;
 			return {

@@ -25,6 +25,7 @@ import { StringEnum, Type, type Usage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { type AgentConfig, type ThinkingLevel, isWriter, loadAgents, resolveThinking } from "./lib/agents-config.ts";
+import { type PreConfirmed, shouldConfirmStartRun } from "./lib/confirm.ts";
 import { type ParsedPlan, parseDepends, parsePlan } from "./lib/plans.ts";
 import { type BriefStep, buildTaskBrief } from "./lib/brief.ts";
 import {
@@ -56,6 +57,12 @@ const HEARTBEAT_SEC = Number.parseInt(process.env.PI_HEARTBEAT_SEC ?? "60", 10) 
 const DEFAULT_TIMEOUT_SEC = 900;
 const MAX_OUTPUT_BYTES = 8 * 1024;
 const WATCHDOG_IDLE_MS = HEARTBEAT_SEC * 2500;
+
+/**
+ * Plan+route the planning agent already confirmed via `orchestrator_execution`.
+ * `start_run` reuses it instead of asking the user a second time.
+ */
+let preConfirmed: PreConfirmed | undefined;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -761,6 +768,8 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async () => {
+		// A fresh session has no handoff approval yet.
+		preConfirmed = undefined;
 		if (!heartbeatDir || heartbeatTimer) return;
 		alive({ event: "start" });
 		heartbeatTimer = setInterval(() => alive({ event: "heartbeat" }), HEARTBEAT_SEC * 1000);
@@ -778,6 +787,13 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 	if (DEPTH > 0) return;
 
 	const activeRuns = new Map<string, RunLedger>();
+
+	// The planning agent already confirmed this plan+route in orchestrator_execution.
+	pi.events.on("orchestrator:handoff-confirmed", (payload) => {
+		const approved = payload as { plan?: unknown; route?: unknown } | undefined;
+		if (typeof approved?.plan !== "string" || typeof approved.route !== "string") return;
+		preConfirmed = { plan: approved.plan, route: approved.route, at: Date.now() };
+	});
 
 	function loadRun(cwd: string, runId?: string): RunLedger | undefined {
 		const id = runId ?? findOpenRunId(cwd);
@@ -845,6 +861,10 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				};
 			}
 
+			// A plan handed off by orchestrator_execution was approved already: do not ask twice.
+			const ask = ctx.hasUI && shouldConfirmStartRun(preConfirmed, planPath, route);
+			preConfirmed = undefined;
+
 			const spec = ROUTES[route];
 			const goal = params.goal?.trim() || parsed?.goal || parsed?.title || `Run ${route}`;
 			const runId = runIdFor(goal);
@@ -900,7 +920,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 			const planned = params.steps?.trim() ? `\n\nPlanned steps:\n${params.steps.trim()}` : "";
 			const agents = spec.agents === "any" ? "any configured agent" : spec.agents.join(", ");
 
-			if (ctx.hasUI) {
+			if (ask) {
 				const approved = await ctx.ui.confirm(
 					`Run ${route}: ${goal.slice(0, 80)}`,
 					`${planPath ? `Plan: ${planPath}\n` : ""}Route: ${route} — ${spec.description}\nMax delegations: ${spec.maxDelegations}\nAgents: ${agents}\n\n${checklist}${planned}`,
@@ -910,8 +930,15 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 					run.endedAt = Date.now();
 					writeRun(ctx.cwd, run);
 					activeRuns.delete(runId);
+					// Return control to the handing-off agent: nothing will be delegated in this run.
+					pi.events.emit("orchestrator:run-finished", { runId, status: "aborted" });
 					return {
-						content: [{ type: "text", text: "Run cancelled by the user. Nothing was delegated." }],
+						content: [
+							{
+								type: "text",
+								text: "Run cancelled by the user. Nothing was delegated. Do not retry with another route or agent; reply to the user in one sentence and stop.",
+							},
+						],
 						details: { runId, cancelled: true },
 					};
 				}
