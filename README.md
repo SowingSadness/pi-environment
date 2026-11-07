@@ -20,18 +20,26 @@
 
 - `agents.ts` — режимы агентов, guard (запрет на запись/деструктивные команды там, где роль read-only),
   цвета/слоты, handoff-тул (передача контекста между агентами).
-- `orchestrator.ts` — тулы оркестрации `start_run` / `delegate` / `finish_run`, heartbeat и учёт
-  запусков подагентов.
-- `lib/` — общие модули: `agents-config`, `runs`, `worktree`, `plans`, `prompt`, `handoff`.
-  `worktree` даёт подагентам изолированные git worktrees, `plans` — чтение `.pi/plans/*.md`,
-  `runs` — состояние run'ов в `.pi/runs/`.
+- `orchestrator.ts` — тулы оркестрации `start_run` / `delegate` / `finish_run` / `close_run` (аварийное
+  закрытие зависшего run'а), heartbeat, живой прогресс подагентов (тикер, текущий инструмент, последняя
+  строка их `log.md`), учёт запусков.
+- `lib/` — общие модули: `agents-config`, `runs`, `worktree`, `plans`, `prompt`, `handoff`, `brief`,
+  `confirm`. `worktree` даёт подагентам изолированные git worktrees, `plans` — чтение `.pi/plans/*.md`,
+  `brief` — бриф со ссылками на план/контекст/прошлые результаты, `confirm` — единственное подтверждение
+  плана, `runs` — состояние run'ов в `.pi/runs/`.
+
+Дополнительно: при переключении агента приходит короткое напоминание роли (`[agent mode] …`), а после
+`finish_run`/`close_run` управление автоматически возвращается агенту, который сделал handoff.
 
 **Документация** — `docs/`: устройство оркестратора, handoff между агентами, readonly-контекст,
 цвета и слоты агентов, план публикации окружения (`docs/env-repo.md`).
 
 ## Требования
 
-- pi ≥ 1.4 (`pi --version`)
+- **pi ≥ 1.5** (`pi --version`). На 1.5.0 проверены: валидация аргументов тулов через
+  `@earendil-works/pi-schema` (коэрция строк в числа и одиночных значений в массивы), `pi.exec` с
+  `maxBuffer`/`truncated`, потоковое чтение `read` и фикс CRLF в `edit`. На 1.4 расширения работают, но
+  без этих исправлений.
 - Node.js (нужен для `scripts/install.mjs`; идёт вместе с pi, если pi поставлен через npm)
 
 ## Установка

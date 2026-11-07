@@ -693,6 +693,7 @@ export default function agentsExtension(pi: ExtensionAPI) {
 	// Hand a finished plan to the orchestrator. Subagents never get to run it.
 	pi.registerTool({
 		name: "orchestrator_execution",
+		annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
 		label: "Hand off the plan",
 		description:
 			"Start implementation of an agreed plan. Hands the plan file to the orchestrator agent, which opens a run, splits the plan into steps, delegates them to coder/reviewer/handyman subagents, tracks progress and reports back; it does not edit code itself. Use it when the plan is written and the user confirmed they want to implement it. Only for the primary planning session - a delegated subagent must return its result instead.",

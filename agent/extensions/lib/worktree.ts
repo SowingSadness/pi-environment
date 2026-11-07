@@ -13,12 +13,14 @@ export interface ExecOutcome {
 	stdout: string;
 	stderr: string;
 	code: number;
+	/** True when pi.exec cut the output at `maxBuffer` (pi >= 1.5). */
+	truncated?: boolean;
 }
 
 export type CommandRunner = (
 	command: string,
 	args: string[],
-	options?: { cwd?: string; signal?: AbortSignal; timeout?: number },
+	options?: { cwd?: string; signal?: AbortSignal; timeout?: number; maxBuffer?: number },
 ) => Promise<ExecOutcome>;
 
 export interface WorktreeInfo {

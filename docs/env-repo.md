@@ -287,7 +287,7 @@ git clone https://github.com/SowingSadness/pi-environment.git ~/pi-environment
 ## 7. README репозитория (коротко)
 
 - что внутри (6 агентов, оркестратор, guard, worktree);
-- требования (pi ≥ 1.4, node);
+- требования (pi ≥ 1.5, node);
 - установка (2 команды) и обновление;
 - как добавить своего агента (agents.json + `slot`);
 - дисклеймер: секретов в репозитории нет, `auth.json`/`sessions/` не коммитятся.
@@ -309,4 +309,4 @@ git clone https://github.com/SowingSadness/pi-environment.git ~/pi-environment
 | Сломать чужие расширения | install трогает только `agents.ts`, `orchestrator.ts`, `lib`; остальное не удаляет |
 | Windows без прав на symlink | junction для каталогов, `--copy` как fallback |
 | Репозиторий приватный | пуш и clone требуют `gh auth login` / PAT — делает пользователь |
-| Разные версии pi | README фиксирует «≥1.4»; `pi --help` как smoke-тест |
+| Разные версии pi | README фиксирует «≥1.5»; `pi --help` как smoke-тест |

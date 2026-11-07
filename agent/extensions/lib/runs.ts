@@ -220,6 +220,17 @@ export function validateBatch(
 	return { ok: true, concurrency: Math.max(1, Math.min(limit, tasks.length)) };
 }
 
+/**
+ * A plan without a `## Context` section needs a read-only scout task before any writer runs,
+ * but only on routes that allow a read-only agent (express allows handyman only).
+ */
+export function needsProductContext(route: RouteName, hasContext: boolean): boolean {
+	if (hasContext) return false;
+	const spec = ROUTES[route];
+	if (!spec) return false;
+	return spec.agents === "any" || spec.agents.includes("scout");
+}
+
 /** Branch created for a worktree task. */
 export function branchNameFor(runId: string, taskId: string): string {
 	return `agent/${runId}/${taskId}`;

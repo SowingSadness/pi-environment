@@ -35,6 +35,7 @@ import {
 	ensureGitignore,
 	findOpenRunId,
 	loadOrchestratorConfig,
+	needsProductContext,
 	runDir,
 	runIdFor,
 	validateBatch,
@@ -272,6 +273,14 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	return { command: "pi", args };
 }
 
+/** Cap git/setup output so a noisy command cannot exhaust memory (pi.exec honours maxBuffer since 1.5). */
+const DEFAULT_EXEC_MAX_BUFFER = 4 * 1024 * 1024;
+
+function commandRunner(pi: ExtensionAPI): CommandRunner {
+	return (command, args, options = {}) =>
+		pi.exec(command, args, { ...options, maxBuffer: options.maxBuffer ?? DEFAULT_EXEC_MAX_BUFFER });
+}
+
 /** Run an optional setup command inside a fresh worktree (shell needed: "npm ci" is a string). */
 async function runSetupCommand(runner: CommandRunner, command: string, cwd: string, signal?: AbortSignal) {
 	const shell =
@@ -316,6 +325,7 @@ function buildBrief(params: {
 		title: item.title,
 		status: item.status,
 		agent: item.agent,
+		files: item.files,
 		depends: item.depends,
 		acceptance: item.acceptance,
 	}));
@@ -807,6 +817,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "start_run",
+		annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
 		label: "Start run",
 		description:
 			"Open an orchestration run: pick the route, store the goal, ask the user once for confirmation and return the checklist. delegate() only works inside an open run.",
@@ -886,7 +897,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 					: undefined,
 				planPath,
 				planTitle: parsed?.title,
-				needsContext: Boolean(parsed && !parsed.context?.trim()),
+				needsContext: parsed ? needsProductContext(route, Boolean(parsed.context?.trim())) : false,
 				root: ctx.cwd,
 				startedAt: Date.now(),
 				status: "open",
@@ -919,6 +930,20 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 					: spec.steps.map((step, index) => `${index + 1}. ${step}`).join("\n");
 			const planned = params.steps?.trim() ? `\n\nPlanned steps:\n${params.steps.trim()}` : "";
 			const agents = spec.agents === "any" ? "any configured agent" : spec.agents.join(", ");
+
+			// Steps without an agent, and writer steps without files, are rejected by delegate(): say so up front.
+			const planWarnings: string[] = [];
+			const planAgentConfigs = planSteps.length > 0 ? loadAgents(ctx.cwd) : {};
+			planSteps.forEach((step, index) => {
+				if (!step.agent) planWarnings.push(`step ${index + 1} has no agent`);
+				else if (isWriter(planAgentConfigs[step.agent]) && step.files.length === 0) {
+					planWarnings.push(`step ${index + 1} has no files[]`);
+				}
+			});
+			const planWarning =
+				planWarnings.length > 0
+					? `WARNING: ${planWarnings.join(", ")} — delegation for them will be rejected; fix the plan (only ### under ## Steps become steps).`
+					: "";
 
 			if (ask) {
 				const approved = await ctx.ui.confirm(
@@ -954,6 +979,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 							"",
 							"Route checklist:",
 							checklist,
+							...(planWarning ? ["", planWarning] : []),
 							...(run.needsContext
 								? [
 										"",
@@ -972,6 +998,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "delegate",
+		annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
 		label: "Delegate",
 		description:
 			"Run one or more tasks in isolated subagent processes and return their summaries. Subagents do not see this conversation, so pass everything they need in `context`.",
@@ -1002,7 +1029,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 			const agents = loadAgents(ctx.cwd);
 			const tasks = params.tasks as DelegateTask[];
 			const config = loadOrchestratorConfig(ctx.cwd);
-			const runner: CommandRunner = (command, args, options) => pi.exec(command, args, options);
+			const runner = commandRunner(pi);
 			const validation = validateBatch(run.route, tasks, agents, {
 				delegations: run.tasks.length,
 				worktrees: run.tasks.filter((record) => record.worktree).length,
@@ -1051,6 +1078,39 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 					details: { runId: run.id, route: run.route, results: [...outcomes] } satisfies DelegateDetails,
 				});
 
+			// A job that throws (brief build, spawn, bookkeeping) must fail alone: record it, keep the batch going.
+			const failJob = (job: Job, error: unknown) => {
+				const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+				const firstLine = detail.split("\n")[0] || detail;
+				const output = clip(`delegate failed: ${firstLine}`, MAX_OUTPUT_BYTES);
+				job.ledgerTask.status = "failed";
+				job.ledgerTask.endedAt = Date.now();
+				if (!run.tasks.includes(job.ledgerTask)) run.tasks.push(job.ledgerTask);
+				const existing = outcomes.find((item) => item.id === job.taskId);
+				if (existing) {
+					existing.status = "failed";
+					existing.stderr = detail;
+					existing.exitCode = -1;
+					existing.output = output;
+					existing.durationMs = Date.now() - job.ledgerTask.startedAt;
+				} else {
+					outcomes.push({
+						id: job.taskId,
+						agent: job.task.agent,
+						status: "failed",
+						output,
+						stderr: detail,
+						exitCode: -1,
+						durationMs: Date.now() - job.ledgerTask.startedAt,
+						usage: job.ledgerTask.usage,
+						taskDir: join(runDir(ctx.cwd, run.id), "tasks", job.taskId),
+						idleMs: 0,
+					});
+				}
+				writeRun(ctx.cwd, run);
+				emitUpdate();
+			};
+
 			const reject = (message: string) => ({
 				content: [{ type: "text", text: `delegate rejected: ${message}` }],
 				details: { runId: run.id },
@@ -1064,6 +1124,17 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				if (!record) {
 					stepIssues.push(`agent "${task.agent}" references step ${task.step}, but the run has no such plan step`);
 					continue;
+				}
+				if (!record.agent) {
+					stepIssues.push(
+						`step ${task.step} has no agent in the plan: only ### headings under ## Steps become steps and each needs '- agent: <name>'; fix the plan instead of delegating`,
+					);
+					continue;
+				}
+				if (isWriter(agents[record.agent]) && (record.files ?? []).length === 0) {
+					stepIssues.push(
+						`step ${task.step} (agent ${record.agent}) has no files[] in the plan; add '- files: [path, ...]' so parallel writers cannot collide`,
+					);
 				}
 				for (const dep of record.depends) {
 					const dependency = run.planSteps?.find((item) => item.index === dep);
@@ -1123,25 +1194,29 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				mergeJob.ledgerTask.status = "running";
 				run.tasks.push(mergeJob.ledgerTask);
 				writeRun(ctx.cwd, run);
-				await runChildAgent({
-					root: ctx.cwd,
-					run,
-					agentName: mergeJob.task.agent,
-					agent: agents[mergeJob.task.agent],
-					level: resolveThinking(agents[mergeJob.task.agent], parentLevel),
-					task: mergeJob.task,
-					taskId: mergeJob.taskId,
-					index: mergeJob.index,
-					total: jobs.length,
-					signal,
-					outcomes,
-					onUpdate: emitUpdate,
-					ledgerTask: mergeJob.ledgerTask,
-					runner,
-					cwd: ctx.cwd,
-					merge: { branches, target },
-					briefOverride: buildMergeBrief({ run, task: mergeJob.task, branches, target }),
-				});
+				try {
+					await runChildAgent({
+						root: ctx.cwd,
+						run,
+						agentName: mergeJob.task.agent,
+						agent: agents[mergeJob.task.agent],
+						level: resolveThinking(agents[mergeJob.task.agent], parentLevel),
+						task: mergeJob.task,
+						taskId: mergeJob.taskId,
+						index: mergeJob.index,
+						total: jobs.length,
+						signal,
+						outcomes,
+						onUpdate: emitUpdate,
+						ledgerTask: mergeJob.ledgerTask,
+						runner,
+						cwd: ctx.cwd,
+						merge: { branches, target },
+						briefOverride: buildMergeBrief({ run, task: mergeJob.task, branches, target }),
+					});
+				} catch (error) {
+					failJob(mergeJob, error);
+				}
 				writeRun(ctx.cwd, run);
 			} else {
 				const worktreeJobs = jobs.filter((job) => job.task.worktree);
@@ -1170,6 +1245,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 								code: setup.code,
 								stdout: setup.stdout.slice(-4_000),
 								stderr: setup.stderr.slice(-4_000),
+								truncated: setup.truncated === true,
 							});
 							if (setup.code !== 0) {
 								return rejectAfterCreate(
@@ -1188,26 +1264,30 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				writeRun(ctx.cwd, run);
 
 				await mapWithConcurrency(jobs, concurrency, async (job) => {
-					await runChildAgent({
-						root: ctx.cwd,
-						run,
-						agentName: job.task.agent,
-						agent: agents[job.task.agent],
-						level: resolveThinking(agents[job.task.agent], parentLevel),
-						task: job.task,
-						taskId: job.taskId,
-						index: job.index,
-						total: jobs.length,
-						signal,
-						outcomes,
-						onUpdate: emitUpdate,
-						ledgerTask: job.ledgerTask,
-						runner,
-						cwd: job.worktree?.path ?? ctx.cwd,
-						worktree: job.worktree,
-						step: job.task.step,
-						contextDuty: run.needsContext && !isWriter(agents[job.task.agent]),
-					});
+					try {
+						await runChildAgent({
+							root: ctx.cwd,
+							run,
+							agentName: job.task.agent,
+							agent: agents[job.task.agent],
+							level: resolveThinking(agents[job.task.agent], parentLevel),
+							task: job.task,
+							taskId: job.taskId,
+							index: job.index,
+							total: jobs.length,
+							signal,
+							outcomes,
+							onUpdate: emitUpdate,
+							ledgerTask: job.ledgerTask,
+							runner,
+							cwd: job.worktree?.path ?? ctx.cwd,
+							worktree: job.worktree,
+							step: job.task.step,
+							contextDuty: run.needsContext && !isWriter(agents[job.task.agent]),
+						});
+					} catch (error) {
+						failJob(job, error);
+					}
 					if (run.needsContext && job.ledgerTask.status === "done" && !isWriter(agents[job.task.agent])) {
 						run.needsContext = false;
 					}
@@ -1267,6 +1347,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "finish_run",
+		annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
 		label: "Finish run",
 		description: "Close the orchestration run, write summary.md and return the final report for the user.",
 		promptSnippet: "Close the run and write its summary",
@@ -1300,7 +1381,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				};
 			}
 
-			const runner: CommandRunner = (command, args, options) => pi.exec(command, args, options);
+			const runner = commandRunner(pi);
 			const cleanupErrors: string[] = [];
 			if (params.cleanupWorktrees) {
 				for (const task of run.tasks) {
@@ -1394,6 +1475,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "close_run",
+		annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
 		label: "Close run",
 		description:
 			"Force-close an open run whose tasks are stuck or whose processes were killed: best-effort PID kill, unfinished tasks become aborted, close.md records what was left behind.",
@@ -1472,7 +1554,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				aborted.push(task.id);
 			}
 
-			const runner: CommandRunner = (command, args, options) => pi.exec(command, args, options);
+			const runner = commandRunner(pi);
 			const cleanupErrors: string[] = [];
 			const removedWorktrees: string[] = [];
 			if (params.cleanupWorktrees) {
