@@ -13,6 +13,7 @@ export interface BriefStep {
 	agent?: string;
 	depends?: number[];
 	acceptance?: string;
+	files?: string[];
 }
 
 export interface TaskBriefParams {
@@ -67,11 +68,16 @@ export function buildTaskBrief(params: TaskBriefParams): string {
 
 	const taskDir = `.pi/runs/${runId}/tasks/${taskId}`;
 	const plannedStep = step && steps ? steps.find((item) => item.index === step) : undefined;
+	const stepFiles = plannedStep?.files ?? [];
 	const stepAcceptance = plannedStep
 		? (plannedStep.acceptance ??
-			(plannedStep.files.length > 0 ? `files ${plannedStep.files.join(", ")}` : "as described in the plan"))
+			(stepFiles.length > 0 ? `files ${stepFiles.join(", ")}` : "as described in the plan"))
 		: undefined;
-	const fileList = files?.length ? files.map((file) => `  - ${file}`).join("\n") : "  - (not specified)";
+	const fileList = files?.length
+		? files.map((file) => `  - ${file}`).join("\n")
+		: stepFiles.length > 0
+			? stepFiles.map((file) => `  - ${file}`).join("\n")
+			: "  - (not specified)";
 	const stepList = steps?.length
 		? steps
 				.map((item) => {

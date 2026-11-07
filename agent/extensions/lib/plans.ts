@@ -38,12 +38,42 @@ export interface ParsedPlan {
 
 const ROUTES = new Set<string>(["full", "fast", "express"]);
 
+/** Section names that hold the step list: `## Steps`, `## steps:`, `## Шаги`, `## ШАГИ `. */
+const STEP_SECTIONS = new Set<string>(["steps", "шаги"]);
+
 function parseFiles(value: string): string[] {
 	return value
 		.replace(/^\[|\]$/g, "")
 		.split(",")
 		.map((item) => item.trim().replace(/^["'`]|["'`]$/g, ""))
 		.filter(Boolean);
+}
+
+function normalizeSection(value: string): string {
+	return value
+		.trim()
+		.toLowerCase()
+		.replace(/\s+/g, " ")
+		.replace(/[:：]+$/, "")
+		.trim();
+}
+
+function isStepSection(value: string | undefined): boolean {
+	return value !== undefined && STEP_SECTIONS.has(normalizeSection(value));
+}
+
+/**
+ * Pre-pass: does the document have an explicit steps section at all?
+ *
+ * With one, only `###` inside it counts as a step (`###` in `## Design`, `## Notes`, … is prose).
+ * Without one we keep the 1.5.0 behaviour: any `###` is a step, so old plans still parse.
+ */
+function hasStepSection(text: string): boolean {
+	for (const rawLine of text.split(/\r?\n/)) {
+		const h2 = /^##\s+(.+)$/.exec(rawLine.trim());
+		if (h2 && isStepSection(h2[1])) return true;
+	}
+	return false;
 }
 
 function toRoute(value: string | undefined): PlanRoute | undefined {
@@ -53,6 +83,7 @@ function toRoute(value: string | undefined): PlanRoute | undefined {
 
 export function parsePlan(text: string): ParsedPlan {
 	const result: ParsedPlan = { steps: [] };
+	const explicitSteps = hasStepSection(text);
 	const goalLines: string[] = [];
 	const contextLines: string[] = [];
 	let section: string | undefined;
@@ -78,16 +109,20 @@ export function parsePlan(text: string): ParsedPlan {
 
 		const h3 = /^###\s+(.+)$/.exec(line);
 		if (h3) {
+			// With an explicit steps section only `###` inside it starts a step: `###` in `## Design`,
+			// `## Context`, `## Risks` etc. is prose/structuring and must not create steps.
+			if (explicitSteps && !isStepSection(section)) continue;
 			flushStep();
 			step = { title: h3[1].replace(/^\d+[.)]\s*/, "").trim(), files: [] };
-			section = "steps";
+			// No steps section: 1.5.0 treated the heading itself as the start of the steps section.
+			if (!explicitSteps) section = "steps";
 			continue;
 		}
 
 		const h2 = /^##\s+(.+)$/.exec(line);
 		if (h2) {
 			flushStep();
-			section = h2[1].trim().toLowerCase();
+			section = normalizeSection(h2[1]);
 			continue;
 		}
 
@@ -122,14 +157,14 @@ export function parsePlan(text: string): ParsedPlan {
 
 	flushStep();
 
-	// Fallback: numbered list under "## Steps" instead of "###" headings.
+	// Fallback: numbered list under "## Steps"/"## Шаги" instead of "###" headings.
 	if (result.steps.length === 0) {
 		let inSteps = false;
 		for (const rawLine of text.split(/\r?\n/)) {
 			const line = rawLine.trim();
 			const h2 = /^##\s+(.+)$/.exec(line);
 			if (h2) {
-				inSteps = h2[1].trim().toLowerCase() === "steps";
+				inSteps = isStepSection(h2[1]);
 				continue;
 			}
 			if (!inSteps) continue;
