@@ -97,6 +97,8 @@ interface RunTaskRecord {
 	files?: string[];
 	/** 1-based plan step this task implements. */
 	step?: number;
+	/** Plan step this untagged task closes; set only when the task has no `step`. */
+	satisfies?: number;
 	worktree?: RunWorktree;
 	merge?: RunMerge;
 }
@@ -147,6 +149,9 @@ interface TaskOutcome {
 	merge?: RunMerge;
 }
 
+/** A delegate task plus the untagged way to close a plan step (`satisfies`). */
+type PlannedTask = DelegateTask & { satisfies?: number };
+
 interface DelegateDetails {
 	runId: string;
 	route: RouteName;
@@ -192,6 +197,98 @@ function resolvePlanPath(cwd: string, input: string): string {
 				? join(home, trimmed.slice(2))
 				: trimmed;
 	return resolve(cwd, expanded);
+}
+
+/**
+ * Re-read the plan file the run was started with and rebuild its steps.
+ * `done` is carried over only for a step that kept both its index and its title: an edited step is new work.
+ * Returns undefined when there is no readable plan file, so the caller keeps the start_run snapshot.
+ */
+function reloadPlanSteps(run: RunLedger): RunStepRecord[] | undefined {
+	const path = run.planPath;
+	if (!path || !existsSync(path)) return undefined;
+	let parsed: ParsedPlan;
+	try {
+		parsed = parsePlan(readFileSync(path, "utf-8"));
+	} catch {
+		return undefined;
+	}
+	if (parsed.steps.length === 0) return undefined;
+	const previous = run.planSteps ?? [];
+	return parsed.steps.map((item, index): RunStepRecord => {
+		const prior = previous.find((record) => record.index === index + 1 && record.title === item.title);
+		return {
+			index: index + 1,
+			title: item.title,
+			agent: item.agent,
+			files: item.files,
+			depends: parseDepends(item.depends),
+			acceptance: item.acceptance,
+			status: prior?.status === "done" ? "done" : "pending",
+		};
+	});
+}
+
+/** `dep→step` edges of the plan DAG in one line, e.g. "1→4; 2→3". */
+function planEdges(steps: RunStepRecord[]): string {
+	const known = new Set(steps.map((step) => step.index));
+	const edges: string[] = [];
+	for (const step of steps) {
+		for (const dep of step.depends) if (known.has(dep)) edges.push(`${dep}→${step.index}`);
+	}
+	return edges.join("; ");
+}
+
+/** Longest chain of `depends` links (1 when no step depends on another); cycles are cut, not fatal. */
+function planChainDepth(steps: RunStepRecord[]): number {
+	const byIndex = new Map(steps.map((step) => [step.index, step]));
+	const memo = new Map<number, number>();
+	const walk = (index: number, seen: Set<number>): number => {
+		const cached = memo.get(index);
+		if (cached !== undefined) return cached;
+		const step = byIndex.get(index);
+		if (!step || seen.has(index)) return 0;
+		seen.add(index);
+		let depth = 1;
+		for (const dep of step.depends) {
+			if (!byIndex.has(dep)) continue;
+			depth = Math.max(depth, 1 + walk(dep, seen));
+		}
+		seen.delete(index);
+		memo.set(index, depth);
+		return depth;
+	};
+	let max = 0;
+	for (const step of steps) max = Math.max(max, walk(step.index, new Set()));
+	return max;
+}
+
+/** How many steps can be ready at the same time at best: the widest level of the plan DAG. */
+function planWidth(steps: RunStepRecord[]): number {
+	const byIndex = new Map(steps.map((step) => [step.index, step]));
+	const level = new Map<number, number>();
+	const walk = (index: number, seen: Set<number>): number => {
+		const cached = level.get(index);
+		if (cached !== undefined) return cached;
+		const step = byIndex.get(index);
+		if (!step || seen.has(index)) return 0;
+		seen.add(index);
+		let value = 0;
+		for (const dep of step.depends) {
+			if (byIndex.has(dep)) value = Math.max(value, 1 + walk(dep, seen));
+		}
+		seen.delete(index);
+		level.set(index, value);
+		return value;
+	};
+	const counts = new Map<number, number>();
+	for (const step of steps) {
+		const value = walk(step.index, new Set());
+		counts.set(value, (counts.get(value) ?? 0) + 1);
+	}
+	let max = 0;
+	for (const count of counts.values()) max = Math.max(max, count);
+	return max;
 }
 
 function formatUsage(usage: Usage): string {
@@ -708,6 +805,9 @@ const delegateParams = Type.Object({
 			step: Type.Optional(
 				Type.Number({ description: "1-based plan step this task implements; the plan's depends[] is enforced" }),
 			),
+			satisfies: Type.Optional(
+				Type.Number({ description: "plan step this untagged task closes; marked done on success" }),
+			),
 			scope: Type.Optional(
 				Type.String({ description: "Ownership scope in words; anything outside it must not be touched" }),
 			),
@@ -872,6 +972,31 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				};
 			}
 
+			// Fatal preflight: a plan whose steps cannot be delegated must never open a run.
+			const preflightSteps = parsed?.steps ?? [];
+			const planWarnings: string[] = [];
+			if (preflightSteps.length > 0) {
+				const planAgentConfigs = loadAgents(ctx.cwd);
+				preflightSteps.forEach((step, index) => {
+					if (!step.agent) planWarnings.push(`step ${index + 1} has no agent`);
+					else if (isWriter(planAgentConfigs[step.agent]) && step.files.length === 0) {
+						planWarnings.push(`step ${index + 1} has no files[]`);
+					}
+				});
+			}
+			if (planWarnings.length > 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `plan invalid: ${planWarnings.join("; ")}; no run was created — fix the plan and call start_run again (only ### headings under ## Steps become steps; every writer step needs '- files: [path, ...]' with at least one path)`,
+						},
+					],
+					details: {},
+					isError: true,
+				};
+			}
+
 			// A plan handed off by orchestrator_execution was approved already: do not ask twice.
 			const ask = ctx.hasUI && shouldConfirmStartRun(preConfirmed, planPath, route);
 			preConfirmed = undefined;
@@ -931,19 +1056,16 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 			const planned = params.steps?.trim() ? `\n\nPlanned steps:\n${params.steps.trim()}` : "";
 			const agents = spec.agents === "any" ? "any configured agent" : spec.agents.join(", ");
 
-			// Steps without an agent, and writer steps without files, are rejected by delegate(): say so up front.
-			const planWarnings: string[] = [];
-			const planAgentConfigs = planSteps.length > 0 ? loadAgents(ctx.cwd) : {};
-			planSteps.forEach((step, index) => {
-				if (!step.agent) planWarnings.push(`step ${index + 1} has no agent`);
-				else if (isWriter(planAgentConfigs[step.agent]) && step.files.length === 0) {
-					planWarnings.push(`step ${index + 1} has no files[]`);
-				}
-			});
-			const planWarning =
-				planWarnings.length > 0
-					? `WARNING: ${planWarnings.join(", ")} — delegation for them will be rejected; fix the plan (only ### under ## Steps become steps).`
-					: "";
+			// A valid plan can still be a chain: show the DAG so a serial tail is visible before the first delegation.
+			const planSummary: string[] = [];
+			const graphSteps = run.planSteps ?? [];
+			if (graphSteps.length > 0) {
+				const edges = planEdges(graphSteps);
+				if (edges) planSummary.push(`depends: ${edges}`);
+				const depth = planChainDepth(graphSteps);
+				planSummary.push(`max width ${planWidth(graphSteps)}, chain depth ${depth}`);
+				if (depth > 3) planSummary.push(`WARNING: chain depth ${depth} — parallelism will collapse`);
+			}
 
 			if (ask) {
 				const approved = await ctx.ui.confirm(
@@ -979,7 +1101,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 							"",
 							"Route checklist:",
 							checklist,
-							...(planWarning ? ["", planWarning] : []),
+							...(planSummary.length > 0 ? ["", ...planSummary] : []),
 							...(run.needsContext
 								? [
 										"",
@@ -1026,8 +1148,15 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				};
 			}
 
+			// The plan may have been fixed on disk after start_run: validate against the current file, not the snapshot.
+			const reloadedSteps = reloadPlanSteps(run);
+			if (reloadedSteps) {
+				run.planSteps = reloadedSteps;
+				writeRun(ctx.cwd, run);
+			}
+
 			const agents = loadAgents(ctx.cwd);
-			const tasks = params.tasks as DelegateTask[];
+			const tasks = params.tasks as PlannedTask[];
 			const config = loadOrchestratorConfig(ctx.cwd);
 			const runner = commandRunner(pi);
 			const validation = validateBatch(run.route, tasks, agents, {
@@ -1068,6 +1197,8 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 						startedAt: Date.now(),
 						usage: emptyUsage(),
 						files: task.files,
+						step: task.step,
+						satisfies: task.satisfies,
 					},
 				};
 			});
@@ -1119,6 +1250,14 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 
 			const stepIssues: string[] = [];
 			for (const task of tasks) {
+				if (task.step !== undefined && task.satisfies !== undefined) {
+					stepIssues.push(
+						`agent "${task.agent}" sets both step ${task.step} and satisfies ${task.satisfies}: use step for the tagged delegation of a step, satisfies only for an untagged task that closes one`,
+					);
+				}
+				if (task.satisfies !== undefined && !run.planSteps?.some((item) => item.index === task.satisfies)) {
+					stepIssues.push(`agent "${task.agent}" closes step ${task.satisfies}, but the run has no such plan step`);
+				}
 				if (task.step === undefined) continue;
 				const record = run.planSteps?.find((item) => item.index === task.step);
 				if (!record) {
@@ -1133,16 +1272,22 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 				}
 				if (isWriter(agents[record.agent]) && (record.files ?? []).length === 0) {
 					stepIssues.push(
-						`step ${task.step} (agent ${record.agent}) has no files[] in the plan; add '- files: [path, ...]' so parallel writers cannot collide`,
+						`step ${task.step} (agent ${record.agent}) has no files[] in the plan; add '- files: [path, ...]' so parallel writers cannot collide; if the step only produces a report, name it as an artifact: '- files: [out/bench/<name>.md]'`,
 					);
 				}
 				for (const dep of record.depends) {
 					const dependency = run.planSteps?.find((item) => item.index === dep);
 					if (dependency?.status === "done") continue;
-					const depTask = run.tasks.find((item) => item.step === dep);
+					// A step also counts as done when a finished task carries it, tagged (step) or untagged (satisfies).
+					const closedByTask = run.tasks.some(
+						(item) => item.status === "done" && (item.step === dep || item.satisfies === dep),
+					);
+					if (closedByTask) continue;
+					const depTask =
+						run.tasks.find((item) => item.step === dep) ?? run.tasks.find((item) => item.satisfies === dep);
 					const resultPath = depTask ? join(runDir(ctx.cwd, run.id), "tasks", depTask.id, "result.md") : undefined;
 					stepIssues.push(
-						`step ${task.step} depends on step ${dep}, which is not done${resultPath ? `; read ${resultPath} first` : ""}`,
+						`step ${task.step} depends on step ${dep}, which is not done${resultPath ? `; read ${resultPath} first` : ""} (или закрой шаг задачей с satisfies: ${dep})`,
 					);
 				}
 			}
@@ -1297,6 +1442,14 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
 						appendFileSync(
 							join(runDir(ctx.cwd, run.id), "results.md"),
 							`- step ${job.task.step} · ${job.task.agent} · done · tasks/${job.taskId}/result.md\n`,
+						);
+					}
+					if (job.task.satisfies && job.ledgerTask.status === "done") {
+						const record = run.planSteps?.find((item) => item.index === job.task.satisfies);
+						if (record) record.status = "done";
+						appendFileSync(
+							join(runDir(ctx.cwd, run.id), "results.md"),
+							`- step ${job.task.satisfies} · ${job.task.agent} · done (untagged) · tasks/${job.taskId}/result.md\n`,
 						);
 					}
 					writeRun(ctx.cwd, run);

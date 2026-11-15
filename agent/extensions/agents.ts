@@ -47,6 +47,7 @@
  *   alt+1..alt+9           - switch to agent N (alphabetical order)
  *   ctrl+alt+1..9          - same, for terminals that swallow alt+digit
  *   ctrl+alt+a             - open the picker
+ *   ctrl+0                 - disable all agents, back to the plain mode (ctrl+alt+0 fallback)
  *   pi --agent architect   - start with an agent
  */
 
@@ -55,11 +56,12 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir, Theme } from "@earendil-works/pi-coding-agent";
-import { Key, Text, colorToHex, type Color } from "@earendil-works/pi-tui";
+import { Key, Text, colorToHex, parseColor, type Color } from "@earendil-works/pi-tui";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import { findOpenRunId } from "./lib/runs.ts";
 import { parsePlan } from "./lib/plans.ts";
 import { buildAgentSection, buildRoleReminder } from "./lib/prompt.ts";
+import { colorLiteralValue, isColorLiteral } from "./lib/colors.ts";
 import { handoffRefusal } from "./lib/handoff.ts";
 import {
 	type AgentConfig,
@@ -463,6 +465,10 @@ function deriveTheme(base: Theme, tokenMap: Record<string, string>, onUnknown: (
 			onUnknown(target);
 			continue;
 		}
+		if (isColorLiteral(source)) {
+			colors[target] = colorLiteralValue(source);
+			continue;
+		}
 		if (!(source in values)) {
 			onUnknown(source);
 			continue;
@@ -503,7 +509,13 @@ export default function agentsExtension(pi: ExtensionAPI) {
 			return;
 		}
 		const suffix = activeGuard ? " (ro)" : "";
-		ctx.ui.setStatus("agent", ctx.ui.theme.fg(statusColorToken, `agent:${activeName}${suffix}`));
+		const label = `agent:${activeName}${suffix}`;
+		ctx.ui.setStatus(
+			"agent",
+			isColorLiteral(statusColorToken)
+				? ctx.ui.theme.style(label, { fg: parseColor(colorLiteralValue(statusColorToken)) })
+				: ctx.ui.theme.fg(statusColorToken, label),
+		);
 	}
 
 	function clearActive() {
@@ -518,6 +530,15 @@ export default function agentsExtension(pi: ExtensionAPI) {
 	function resolveColorToken(ctx: ExtensionContext, value: unknown, fallback: string, field: string): string {
 		const name = typeof value === "string" ? value.trim() : "";
 		if (!name) return fallback;
+		if (isColorLiteral(name)) {
+			try {
+				parseColor(colorLiteralValue(name));
+				return name;
+			} catch {
+				ctx.ui.notify(`agents: invalid color "${name}" in ${field}; using ${fallback}`, "warning");
+				return fallback;
+			}
+		}
 		if (name in (ctx.ui.theme.colors as Record<string, unknown>)) return name;
 		ctx.ui.notify(`agents: unknown theme color "${name}" in ${field}; using ${fallback}`, "warning");
 		return fallback;
@@ -624,6 +645,8 @@ export default function agentsExtension(pi: ExtensionAPI) {
 
 	async function deactivate(ctx: ExtensionContext) {
 		clearActive();
+		// Explicit "no agent" marker: a resumed session must not restore the previous mode.
+		pi.appendEntry("agent-state", { name: null });
 		if (originalState) {
 			if (originalState.model) await pi.setModel(originalState.model);
 			pi.setThinkingLevel(originalState.thinkingLevel);
@@ -689,6 +712,25 @@ export default function agentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerShortcut(Key.ctrlAlt("a"), { description: "Select agent", handler: pick });
+
+	// ctrl+0 leaves agent mode entirely: model, thinking level and tools go back to the snapshot
+	// taken before the first activation, and the <agent> prompt section is dropped.
+	const disableAgents = async (ctx: ExtensionContext) => {
+		if (!activeName) {
+			ctx.ui.notify("agent: (none)", "info");
+			return;
+		}
+		await deactivate(ctx);
+	};
+	pi.registerShortcut(Key.ctrl("0"), {
+		description: "Disable agents (plain mode)",
+		handler: disableAgents,
+	});
+	// Terminals that grab ctrl+0 (font reset/zoom) need the modifier variant.
+	pi.registerShortcut(Key.ctrlAlt("0"), {
+		description: "Disable agents (plain mode)",
+		handler: disableAgents,
+	});
 
 	// Hand a finished plan to the orchestrator. Subagents never get to run it.
 	pi.registerTool({

@@ -296,6 +296,7 @@ git clone https://github.com/SowingSadness/pi-environment.git ~/pi-environment
 
 1. `pi --help` — без «extension error»/«failed to load».
 2. `/agent` или `alt+1..6` — архитектор, кодер, оркестратор, ревьюер, скаут, хендимен; слоты 1–6.
+   `ctrl+0` — агенты выключены: статус `agent:…` исчез, `/agent` не показывает активного.
 3. `pi --agent architect -p "reply OK"` — в системном промпте секция `## Runtime constraints` с абсолютным `.pi/plans`.
 4. `pi --agent orchestrator -p "reply OK"` — инструменты `start_run/delegate/finish_run` в списке.
 5. `git -C ~/pi-environment status` — чисто; `git pull` повторяемо ничего не ломает.
