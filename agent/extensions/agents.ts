@@ -47,7 +47,7 @@
  *   alt+1..alt+9           - switch to agent N (alphabetical order)
  *   ctrl+alt+1..9          - same, for terminals that swallow alt+digit
  *   ctrl+alt+a             - open the picker
- *   ctrl+0                 - disable all agents, back to the plain mode (ctrl+alt+0 fallback)
+ *   alt+0                  - disable all agents, back to the plain mode (ctrl+alt+0 fallback)
  *   pi --agent architect   - start with an agent
  */
 
@@ -713,7 +713,7 @@ export default function agentsExtension(pi: ExtensionAPI) {
 
 	pi.registerShortcut(Key.ctrlAlt("a"), { description: "Select agent", handler: pick });
 
-	// ctrl+0 leaves agent mode entirely: model, thinking level and tools go back to the snapshot
+	// alt+0 leaves agent mode entirely: model, thinking level and tools go back to the snapshot
 	// taken before the first activation, and the <agent> prompt section is dropped.
 	const disableAgents = async (ctx: ExtensionContext) => {
 		if (!activeName) {
@@ -722,11 +722,11 @@ export default function agentsExtension(pi: ExtensionAPI) {
 		}
 		await deactivate(ctx);
 	};
-	pi.registerShortcut(Key.ctrl("0"), {
+	pi.registerShortcut(Key.alt("0"), {
 		description: "Disable agents (plain mode)",
 		handler: disableAgents,
 	});
-	// Terminals that grab ctrl+0 (font reset/zoom) need the modifier variant.
+	// Terminals that swallow alt+digit need the modifier variant.
 	pi.registerShortcut(Key.ctrlAlt("0"), {
 		description: "Disable agents (plain mode)",
 		handler: disableAgents,
